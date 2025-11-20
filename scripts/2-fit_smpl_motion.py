@@ -39,6 +39,21 @@ SMPL_BONE_ORDER_NAMES = [
 ]
 
 
+def parse_joint_limits_from_mjcf(root):
+    limits = {}
+    for j in root.findall(".//joint"):
+        jtype = j.get("type", "hinge")
+        if jtype not in ("hinge", "slide"):
+            continue
+        name = j.get("name")
+        rng = j.get("range")
+        if name is None or rng is None:
+            continue
+        low, high = map(float, rng.split())
+        limits[name] = (low, high)
+    return limits
+
+
 def build_chain(cfg) -> pk.Chain:
     mjcf_path = cfg.asset.assetFileName
 
@@ -71,12 +86,14 @@ def build_chain(cfg) -> pk.Chain:
     os.chdir(os.path.dirname(mjcf_path))
     chain = pk.build_chain_from_mjcf(ET.tostring(root, method="xml"), body=root_name)
     os.chdir(cwd)
-    return chain
+
+    joint_limits = parse_joint_limits_from_mjcf(root)
+    return chain, joint_limits
 
 
 @hydra.main(version_base=None, config_path="../cfg", config_name="unitree_g1_fitting")
 def main(cfg):
-    chain = build_chain(cfg)
+    chain, joint_limits = build_chain(cfg)
     chain.forward_kinematics(torch.zeros(1, chain.n_joints))
 
     motion_path = os.path.join(DATA_PATH, "AMASS/SFU/0005/0005_Walking001_poses.npz")
@@ -84,6 +101,10 @@ def main(cfg):
     with open(motion_path, "rb") as f:
         motion = dict(np.load(f))
     
+
+    fps = int(motion["mocap_framerate"].item()) \
+        if "mocap_framerate" in motion \
+        else int(motion["mocap_frame_rate"].item())
     T = motion["poses"].shape[0]
     motion["poses"] = motion["poses"][:, :66].reshape(T, 22, 3)
     body_pose = torch.as_tensor(motion["poses"][:, 1:], dtype=torch.float32)
@@ -114,10 +135,22 @@ def main(cfg):
         robot_body_names.append(robot_body_name)
         smpl_joint_idx.append(SMPL_BONE_ORDER_NAMES.index(smpl_joint_name))
 
+    # Extract joint limits
+    joint_names = chain.get_joint_parameter_names()
+    assert len(joint_names) == len(joint_limits), f"Number of joints in chain ({len(joint_names)}) does not match number of joint limits ({len(joint_limits)})"
+
+    low_list, high_list = [], []
+    for joint_name, (joint_limit_key, joint_limit_val) in zip(joint_names, joint_limits.items()):
+        assert joint_name == joint_limit_key, f"Joint name {joint_name} does not match joint name in joint limits ({joint_limit_key})"
+        low_list.append(joint_limit_val[0])
+        high_list.append(joint_limit_val[1])
+    low = torch.as_tensor(low_list, dtype=torch.float32).unsqueeze(0)   # [1, J]
+    high = torch.as_tensor(high_list, dtype=torch.float32).unsqueeze(0) # [1, J]
+
     # since the betas are changed and so are the SMPL body morphology,
     # we need to make some corrections to avoid ground pentration
     ground_offset = result.vertices[:, :, 2].min()
-    smpl_keypoints = result.joints[:, smpl_joint_idx] - ground_offset
+    smpl_keypoints_w = result.joints[:, smpl_joint_idx] - ground_offset
 
     robot_rot = sRot.from_rotvec(data["global_orient"]) * sRot.from_euler("xyz", [np.pi/2, 0., np.pi/2]).inv()
     robot_rotmat = torch.as_tensor(robot_rot.as_matrix(), dtype=torch.float32)
@@ -128,20 +161,29 @@ def main(cfg):
 
     indices = chain.get_all_frame_indices()
     
-    def get_robot_keypoints(th: torch.Tensor, trans: torch.Tensor):
-        body_pos = chain.forward_kinematics(th, indices) # in robot's root frame
-        robot_keypoints = torch.stack([
-            body_pos[name].get_matrix()[:, :3, 3]
-            for name in robot_body_names
-        ], dim=1)
-        # convert to world frame
-        robot_keypoints = robot_rotmat.unsqueeze(1) @ robot_keypoints.unsqueeze(-1)
-        robot_keypoints = robot_keypoints.squeeze(-1) + trans.unsqueeze(1)
-        return robot_keypoints
+    def mat_rotate(rotmat, v):
+        return (rotmat @ v.unsqueeze(-1)).squeeze(-1)
         
-    for i in range(300):
-        robot_keypoints = get_robot_keypoints(robot_th, robot_trans)
-        loss = nn.functional.mse_loss(robot_keypoints, smpl_keypoints)
+    for i in range(500):
+        fk_output = chain.forward_kinematics(robot_th, indices) # in robot's root frame
+        robot_keypoints_b = torch.stack([
+            fk_output[name].get_matrix()[:, :3, 3]
+            for name in robot_body_names
+        ], dim=1)        
+        # convert to world frame
+        robot_keypoints_w = robot_trans.unsqueeze(1) + mat_rotate(robot_rotmat.unsqueeze(1), robot_keypoints_b)
+
+        omega = torch.gradient(robot_th, spacing=1/fps, dim=0)[0]    # [T, J]
+        
+        violate_low  = torch.relu(low  - robot_th)
+        violate_high = torch.relu(robot_th - high)
+        L_limit = (violate_low**2 + violate_high**2).mean()
+
+        keypoints_pos_error = nn.functional.mse_loss(robot_keypoints_w, smpl_keypoints_w)
+        joint_pos_reg = 1e-2 * torch.mean(torch.square(robot_th))
+        joint_vel_reg = 1e-3 * torch.mean(torch.square(omega))
+        joint_limit_reg = 1e2 * L_limit
+        loss = keypoints_pos_error + joint_pos_reg + joint_vel_reg + joint_limit_reg
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -149,13 +191,18 @@ def main(cfg):
             print(f"iter {i}, loss {100 * loss.item():.3f}")
     
     with torch.no_grad():
-        robot_keypoints = get_robot_keypoints(robot_th, robot_trans)
+        fk_output = chain.forward_kinematics(robot_th, indices)
+        robot_keypoints_b = torch.stack([
+            fk_output[name].get_matrix()[:, :3, 3]
+            for name in robot_body_names
+        ], dim=1)
+        robot_keypoints_w = robot_trans.unsqueeze(1) + mat_rotate(robot_rotmat.unsqueeze(1), robot_keypoints_b)
     
     motion_name = motion_path.split("/")[-1].split(".")[0]
     save_path = f"{motion_name}.pt"
     data = {
         "joint_pos": robot_th.data.numpy(),
-        "keypoint_pos_w": robot_keypoints.data.numpy(),
+        "keypoint_pos_w": robot_keypoints_w.data.numpy(),
         "root_pos_w": robot_trans.data.numpy(),
         "root_quat_w": robot_rot.as_quat(),
     }
@@ -187,13 +234,13 @@ def main(cfg):
     vis.add_geometry(frame)
 
     robot_pcd = o3d.geometry.PointCloud()
-    robot_pcd.points = o3d.utility.Vector3dVector(robot_keypoints[0])
-    robot_pcd.colors = o3d.utility.Vector3dVector(torch.tensor([0, 0, 1]).expand_as(robot_keypoints[0]))
+    robot_pcd.points = o3d.utility.Vector3dVector(robot_keypoints_w[0])
+    robot_pcd.colors = o3d.utility.Vector3dVector(torch.tensor([0, 0, 1]).expand_as(robot_keypoints_w[0]))
     vis.add_geometry(robot_pcd)
 
     smpl_pcd = o3d.geometry.PointCloud()
-    smpl_pcd.points = o3d.utility.Vector3dVector(result.joints[0, smpl_joint_idx])
-    smpl_pcd.colors = o3d.utility.Vector3dVector(torch.tensor([1, 0, 0]).expand_as(result.joints[0, smpl_joint_idx]))
+    smpl_pcd.points = o3d.utility.Vector3dVector(smpl_keypoints_w[0])
+    smpl_pcd.colors = o3d.utility.Vector3dVector(torch.tensor([1, 0, 0]).expand_as(smpl_keypoints_w[0]))
     vis.add_geometry(smpl_pcd)
 
     opt = vis.get_render_option()
@@ -206,10 +253,10 @@ def main(cfg):
         # mesh.compute_vertex_normals()
         # vis.update_geometry(mesh)
 
-        robot_pcd.points = o3d.utility.Vector3dVector(robot_keypoints[t])
+        robot_pcd.points = o3d.utility.Vector3dVector(robot_keypoints_w[t])
         vis.update_geometry(robot_pcd)
 
-        smpl_pcd.points = o3d.utility.Vector3dVector(smpl_keypoints[t])
+        smpl_pcd.points = o3d.utility.Vector3dVector(smpl_keypoints_w[t])
         vis.update_geometry(smpl_pcd)
 
         vis.poll_events()
