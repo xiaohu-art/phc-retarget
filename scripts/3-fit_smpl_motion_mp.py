@@ -12,6 +12,8 @@ import joblib
 from smplx import SMPL
 from scipy.spatial.transform import Rotation as sRot, Slerp
 
+from math_utils import quat_mul, quat_from_matrix, quat_error_magnitude
+
 os.environ["OMP_NUM_THREADS"] = "1"
 
 DATA_PATH = os.path.join(os.path.dirname(__file__), "../data")
@@ -159,7 +161,8 @@ def fit_motion(cfg, motion_path: str, fitted_shape: torch.Tensor):
             fitted_shape,
             body_pose=data["body_pose"].reshape(T, 69),
             global_orient=data["global_orient"],
-            transl=data["trans"]
+            transl=data["trans"],
+            return_full_pose=True
         )
     
     # which joints to match
@@ -173,6 +176,30 @@ def fit_motion(cfg, motion_path: str, fitted_shape: torch.Tensor):
     # we need to make some corrections to avoid ground pentration
     ground_offset = result.vertices[:, :, 2].min()
     smpl_keypoints_w = result.joints[:, smpl_joint_idx] - ground_offset
+
+    # Acquire SMPL body pose in world frame
+    full_pose_aa = result.full_pose.reshape(T, 24, 3).numpy()
+    full_pose_quat = sRot.from_rotvec(full_pose_aa.reshape(T * 24, 3)).as_quat()
+    full_pose_quat = full_pose_quat.reshape(T, 24, 4)[:, :, [3, 0, 1, 2]]       # [w, x, y, z]
+
+    smpl_local_quat = torch.as_tensor(full_pose_quat, dtype=torch.float32)
+    parents = body_model.parents
+
+    smpl_global_quat = torch.zeros_like(smpl_local_quat)
+    smpl_global_quat[:, 0] = smpl_local_quat[:, 0]
+    for i in range(1, 24):
+        parent_idx = parents[i]
+        smpl_global_quat[:, i] = quat_mul(smpl_global_quat[:, parent_idx], smpl_local_quat[:, i])
+
+    smpl_global_quat_modified = smpl_global_quat.clone()
+    for joint_name, quat_offset in cfg.quat_offset.items():
+        joint_idx = SMPL_BONE_ORDER_NAMES.index(joint_name)
+        quat_offset = torch.as_tensor(eval(quat_offset), dtype=torch.float32)
+        smpl_global_quat_modified[:, joint_idx] = quat_mul(
+                                        smpl_global_quat[:, joint_idx], 
+                                        quat_offset.expand_as(smpl_global_quat[:, joint_idx])
+                                    )
+    smpl_keypoints_quat_w = smpl_global_quat_modified[:, smpl_joint_idx]
 
     # again, convert between Y-up and Z-up
     robot_rot = sRot.from_rotvec(data["global_orient"]) * sRot.from_euler("xyz", [np.pi/2, 0., np.pi/2]).inv()
@@ -196,6 +223,14 @@ def fit_motion(cfg, motion_path: str, fitted_shape: torch.Tensor):
         # convert to world frame
         robot_keypoints_w = robot_trans.unsqueeze(1) + mat_rotate(robot_rotmat.unsqueeze(1), robot_keypoints_b)
 
+        robot_orient_mats_b = torch.stack([
+            fk_output[name].get_matrix()[:, :3, :3]
+            for name in robot_body_names
+        ], dim=1) # Shape: [T, N, 3, 3]
+        robot_orient_mats_w = torch.matmul(robot_rotmat.unsqueeze(1), robot_orient_mats_b)
+
+        robot_orient_quat_w = quat_from_matrix(robot_orient_mats_w)
+
         omega = torch.gradient(robot_th, spacing=1/cfg.target_fps, dim=0)[0]    # [T, J]
         
         violate_low  = torch.relu(low  - robot_th)
@@ -203,10 +238,11 @@ def fit_motion(cfg, motion_path: str, fitted_shape: torch.Tensor):
         L_limit = (violate_low**2 + violate_high**2).mean()
 
         keypoints_pos_error = nn.functional.mse_loss(robot_keypoints_w, smpl_keypoints_w)
+        keypoints_quat_error = 1e-2 * quat_error_magnitude(robot_orient_quat_w, smpl_keypoints_quat_w).square().mean()
         joint_pos_reg = 1e-2 * torch.mean(torch.square(robot_th))
         joint_vel_reg = 1e-3 * torch.mean(torch.square(omega))
         joint_limit_reg = 1e2 * L_limit
-        loss = keypoints_pos_error + joint_pos_reg + joint_vel_reg + joint_limit_reg
+        loss = keypoints_pos_error + keypoints_quat_error + joint_pos_reg + joint_vel_reg + joint_limit_reg
         opt.zero_grad()
         loss.backward()
         opt.step()

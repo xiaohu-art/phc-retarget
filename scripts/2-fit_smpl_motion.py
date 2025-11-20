@@ -9,6 +9,8 @@ import xml.etree.ElementTree as ET
 from smplx import SMPL
 from scipy.spatial.transform import Rotation as sRot
 
+from math_utils import quat_mul, quat_from_matrix, quat_error_magnitude
+
 DATA_PATH = os.path.join(os.path.dirname(__file__), "../data")
 
 SMPL_BONE_ORDER_NAMES = [
@@ -125,7 +127,8 @@ def main(cfg):
             fitted_shape,
             body_pose=data["body_pose"].reshape(T, 69),
             global_orient=data["global_orient"],
-            transl=data["trans"]
+            transl=data["trans"],
+            return_full_pose=True
         )
     
     # which joints to match
@@ -134,6 +137,35 @@ def main(cfg):
     for robot_body_name, smpl_joint_name in cfg.joint_matches:
         robot_body_names.append(robot_body_name)
         smpl_joint_idx.append(SMPL_BONE_ORDER_NAMES.index(smpl_joint_name))
+
+    # since the betas are changed and so are the SMPL body morphology,
+    # we need to make some corrections to avoid ground pentration
+    ground_offset = result.vertices[:, :, 2].min()
+    smpl_keypoints_w = result.joints[:, smpl_joint_idx] - ground_offset
+
+    # Acquire SMPL body pose in world frame
+    full_pose_aa = result.full_pose.reshape(T, 24, 3).numpy()
+    full_pose_quat = sRot.from_rotvec(full_pose_aa.reshape(T * 24, 3)).as_quat()
+    full_pose_quat = full_pose_quat.reshape(T, 24, 4)[:, :, [3, 0, 1, 2]]       # [w, x, y, z]
+
+    smpl_local_quat = torch.as_tensor(full_pose_quat, dtype=torch.float32)
+    parents = body_model.parents
+
+    smpl_global_quat = torch.zeros_like(smpl_local_quat)
+    smpl_global_quat[:, 0] = smpl_local_quat[:, 0]
+    for i in range(1, 24):
+        parent_idx = parents[i]
+        smpl_global_quat[:, i] = quat_mul(smpl_global_quat[:, parent_idx], smpl_local_quat[:, i])
+
+    smpl_global_quat_modified = smpl_global_quat.clone()
+    for joint_name, quat_offset in cfg.quat_offset.items():
+        joint_idx = SMPL_BONE_ORDER_NAMES.index(joint_name)
+        quat_offset = torch.as_tensor(eval(quat_offset), dtype=torch.float32)
+        smpl_global_quat_modified[:, joint_idx] = quat_mul(
+                                        smpl_global_quat[:, joint_idx], 
+                                        quat_offset.expand_as(smpl_global_quat[:, joint_idx])
+                                    )
+    smpl_keypoints_quat_w = smpl_global_quat_modified[:, smpl_joint_idx]
 
     # Extract joint limits
     joint_names = chain.get_joint_parameter_names()
@@ -147,11 +179,6 @@ def main(cfg):
     low = torch.as_tensor(low_list, dtype=torch.float32).unsqueeze(0)   # [1, J]
     high = torch.as_tensor(high_list, dtype=torch.float32).unsqueeze(0) # [1, J]
 
-    # since the betas are changed and so are the SMPL body morphology,
-    # we need to make some corrections to avoid ground pentration
-    ground_offset = result.vertices[:, :, 2].min()
-    smpl_keypoints_w = result.joints[:, smpl_joint_idx] - ground_offset
-
     robot_rot = sRot.from_rotvec(data["global_orient"]) * sRot.from_euler("xyz", [np.pi/2, 0., np.pi/2]).inv()
     robot_rotmat = torch.as_tensor(robot_rot.as_matrix(), dtype=torch.float32)
 
@@ -163,6 +190,10 @@ def main(cfg):
     
     def mat_rotate(rotmat, v):
         return (rotmat @ v.unsqueeze(-1)).squeeze(-1)
+    
+    print("=" * 100)
+    print(f"{'iter':>6} | {'total_loss':>12} | {'kp_pos_err':>12} | {'kp_quat_err':>12} | {'qpos_reg':>12} | {'qvel_reg':>12} | {'qlimit_reg':>12}")
+    print("=" * 100)
         
     for i in range(500):
         fk_output = chain.forward_kinematics(robot_th, indices) # in robot's root frame
@@ -173,6 +204,14 @@ def main(cfg):
         # convert to world frame
         robot_keypoints_w = robot_trans.unsqueeze(1) + mat_rotate(robot_rotmat.unsqueeze(1), robot_keypoints_b)
 
+        robot_orient_mats_b = torch.stack([
+            fk_output[name].get_matrix()[:, :3, :3]
+            for name in robot_body_names
+        ], dim=1) # Shape: [T, N, 3, 3]
+        robot_orient_mats_w = torch.matmul(robot_rotmat.unsqueeze(1), robot_orient_mats_b)
+
+        robot_orient_quat_w = quat_from_matrix(robot_orient_mats_w)
+
         omega = torch.gradient(robot_th, spacing=1/fps, dim=0)[0]    # [T, J]
         
         violate_low  = torch.relu(low  - robot_th)
@@ -180,15 +219,21 @@ def main(cfg):
         L_limit = (violate_low**2 + violate_high**2).mean()
 
         keypoints_pos_error = nn.functional.mse_loss(robot_keypoints_w, smpl_keypoints_w)
+        keypoints_quat_error = 1e-2 *quat_error_magnitude(robot_orient_quat_w, smpl_keypoints_quat_w).square().mean()
         joint_pos_reg = 1e-2 * torch.mean(torch.square(robot_th))
         joint_vel_reg = 1e-3 * torch.mean(torch.square(omega))
         joint_limit_reg = 1e2 * L_limit
-        loss = keypoints_pos_error + joint_pos_reg + joint_vel_reg + joint_limit_reg
+        loss = keypoints_pos_error + keypoints_quat_error + joint_pos_reg + joint_vel_reg + joint_limit_reg
         opt.zero_grad()
         loss.backward()
         opt.step()
         if i % 10 == 0:
-            print(f"iter {i}, loss {100 * loss.item():.3f}")
+            print(f"{i:6d} | {loss.item():12.6f} | "
+                  f"{keypoints_pos_error.item():12.6f} | "
+                  f"{keypoints_quat_error.item():12.6f} | "
+                  f"{joint_pos_reg.item():12.6f} | "
+                  f"{joint_vel_reg.item():12.6f} | "
+                  f"{joint_limit_reg.item():12.6f}")
     
     with torch.no_grad():
         fk_output = chain.forward_kinematics(robot_th, indices)
