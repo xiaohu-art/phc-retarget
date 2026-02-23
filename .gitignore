@@ -58,6 +58,7 @@ temp/
 data/AMASS/Transitions/
 data/g1_29dof/
 data/smpl/
+data/
 
 # Pickle files
 # *.pkl
