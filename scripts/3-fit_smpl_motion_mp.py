@@ -60,42 +60,88 @@ def parse_joint_limits_from_mjcf(root):
     return limits
 
 
-def build_chain(cfg) -> pk.Chain:
-    mjcf_path = cfg.asset.assetFileName
+def parse_joint_limits_from_urdf(root):
+    limits = {}
+    for j in root.findall(".//joint"):
+        jtype = j.get("type")
+        if jtype not in ("revolute", "prismatic"):
+            continue
+        name = j.get("name")
+        limit = j.find("limit")
+        if name is None or limit is None:
+            continue
+        low = float(limit.get("lower", -3.14159265359))
+        high = float(limit.get("upper", 3.14159265359))
+        limits[name] = (low, high)
+    return limits
 
-    tree = ET.parse(mjcf_path)
+
+def build_chain(cfg) -> pk.Chain:
+    path = cfg.asset.assetFileName
+    is_urdf = path.endswith(".urdf")
+
+    tree = ET.parse(path)
     root = tree.getroot()
 
-    # remove the free joint of the base link
-    root_name = cfg.get("root_name", "pelvis")
-    root_body = root.find(f".//body[@name='{root_name}']")
-    root_joint = root.find(".//joint[@type='free']")
-    root_body.remove(root_joint)
-    root_body.set("pos", "0 0 0")
+    if is_urdf:
+        joint_limits = parse_joint_limits_from_urdf(root)
+    else:
+        # MJCF specific: remove the free joint of the base link
+        root_name = cfg.get("root_name", "pelvis")
+        root_body = root.find(f".//body[@name='{root_name}']")
+        if root_body is not None:
+            root_joint = root_body.find(".//joint[@type='free']")
+            if root_joint is not None:
+                root_body.remove(root_joint)
+            root_body.set("pos", "0 0 0")
+        joint_limits = parse_joint_limits_from_mjcf(root)
 
     for extend_config in cfg.extend_config:
-        parent = root.find(f".//body[@name='{extend_config.parent_name}']")
+        if is_urdf:
+            parent = root.find(f".//link[@name='{extend_config.parent_name}']")
+        else:
+            parent = root.find(f".//body[@name='{extend_config.parent_name}']")
+            
         if parent is None:
-            raise ValueError(f"Parent body {extend_config.parent_name} not found in MJCF")
+            raise ValueError(f"Parent {extend_config.parent_name} not found")
         
         pos = extend_config.pos
-        rot = extend_config.rot
-        # create and insert a dummy body with a fixed joint
-        body = ET.Element("body", name=extend_config.joint_name)
-        body.set("pos", f"{pos[0]} {pos[1]} {pos[2]}")
-        body.set("quat", f"{rot[0]} {rot[1]} {rot[2]} {rot[3]}")
-        inertial = ET.Element("inertial", pos="0 0 0", quat="0 0 0 1", mass="0.1", diaginertia="0.1 0.1 0.1")
-        body.append(inertial)
-        parent.append(body)
+        rot = extend_config.rot # [w, x, y, z]
+
+        if is_urdf: # URDF: Insert link and fixed joint
+            link_name = extend_config.joint_name
+            ET.SubElement(root, "link", name=link_name)
+            
+            joint = ET.SubElement(root, "joint", name=f"fixed_{link_name}", type="fixed")
+            ET.SubElement(joint, "parent", link=extend_config.parent_name)
+            ET.SubElement(joint, "child", link=link_name)
+            
+            # URDF origin uses rpy, rot in yaml is quaternion [w, x, y, z]
+            # scipy needs [x, y, z, w]
+            r = sRot.from_quat([rot[1], rot[2], rot[3], rot[0]])
+            rpy = r.as_euler('xyz')
+            ET.SubElement(joint, "origin", xyz=f"{pos[0]} {pos[1]} {pos[2]}", rpy=f"{rpy[0]} {rpy[1]} {rpy[2]}")
+        else: # MJCF: Insert body
+            body = ET.Element("body", name=extend_config.joint_name)
+            body.set("pos", f"{pos[0]} {pos[1]} {pos[2]}")
+            body.set("quat", f"{rot[0]} {rot[1]} {rot[2]} {rot[3]}")
+            inertial = ET.Element("inertial", pos="0 0 0", quat="0 0 0 1", mass="0.1", diaginertia="0.1 0.1 0.1")
+            body.append(inertial)
+            parent.append(body)
 
     cwd = os.getcwd()
-    os.chdir(os.path.dirname(mjcf_path))
-    chain = pk.build_chain_from_mjcf(ET.tostring(root, method="xml"), body=root_name)
+    os.chdir(os.path.dirname(path))
+    if is_urdf:
+        chain = pk.build_chain_from_urdf(ET.tostring(root, encoding='utf8'))
+    else:
+        chain = pk.build_chain_from_mjcf(ET.tostring(root, method="xml"), body=root_name)
     os.chdir(cwd)
-
-    joint_limits = parse_joint_limits_from_mjcf(root)
-    return chain, joint_limits
-
+    
+    # Filter joint_limits to only include joints present in the chain
+    parameter_names = chain.get_joint_parameter_names()
+    filtered_limits = [joint_limits[name] for name in parameter_names]
+    
+    return chain, filtered_limits
 
 def lerp(x, xp, fp):
     return np.stack([np.interp(x, xp, fp[:, i]) for i in range(fp.shape[1])], axis=1)
@@ -139,10 +185,9 @@ def fit_motion(cfg, motion_path: str, fitted_shape: torch.Tensor):
     assert len(joint_names) == len(joint_limits), f"Number of joints in chain ({len(joint_names)}) does not match number of joint limits ({len(joint_limits)})"
 
     low_list, high_list = [], []
-    for joint_name, (joint_limit_key, joint_limit_val) in zip(joint_names, joint_limits.items()):
-        assert joint_name == joint_limit_key, f"Joint name {joint_name} does not match joint name in joint limits ({joint_limit_key})"
-        low_list.append(joint_limit_val[0])
-        high_list.append(joint_limit_val[1])
+    for joint_name, (l, h) in zip(joint_names, joint_limits):
+        low_list.append(l)
+        high_list.append(h)
     low = torch.as_tensor(low_list, dtype=torch.float32).unsqueeze(0)   # [1, J]
     high = torch.as_tensor(high_list, dtype=torch.float32).unsqueeze(0) # [1, J]
 
@@ -246,8 +291,8 @@ def fit_motion(cfg, motion_path: str, fitted_shape: torch.Tensor):
         opt.zero_grad()
         loss.backward()
         opt.step()
-        # if i % 10 == 0:
-        #     print(f"iter {i}, loss {100 * loss.item():.3f}")
+        if i % 490 == 0:
+            print(f"iter {i}, loss {100 * loss.item():.3f}")
 
     with torch.no_grad():
         robot_keypoints_b = torch.stack([
@@ -274,7 +319,9 @@ def _worker(args):
     cfg, path, betas = args
     return fit_motion(cfg, path, betas)
 
-@hydra.main(version_base=None, config_path="../cfg", config_name="unitree_g1_fitting")
+# @hydra.main(version_base=None, config_path="../cfg", config_name="unitree_g1_fitting")
+@hydra.main(version_base=None, config_path="../cfg", config_name="fourier_gr3_fitting")
+
 def main(cfg):
     if os.path.isdir(cfg.motion_path):
         motion_paths = glob.glob(os.path.join(cfg.motion_path, "**/*.npz"), recursive=True)

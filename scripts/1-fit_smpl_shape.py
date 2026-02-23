@@ -40,40 +40,65 @@ SMPL_BONE_ORDER_NAMES = [
 
 
 def build_chain(cfg) -> pk.Chain:
-    mjcf_path = cfg.asset.assetFileName
+    path = cfg.asset.assetFileName
+    is_urdf = path.endswith(".urdf")
 
-    tree = ET.parse(mjcf_path)
+    tree = ET.parse(path)
     root = tree.getroot()
 
-    # remove the free joint of the base link
-    root_name = cfg.get("root_name", "pelvis")
-    root_body = root.find(f".//body[@name='{root_name}']")
-    root_joint = root.find(".//joint[@type='free']")
-    root_body.remove(root_joint)
+    if not is_urdf: # MJCF specific: remove the free joint of the base link
+        root_name = cfg.get("root_name", "pelvis")
+        root_body = root.find(f".//body[@name='{root_name}']")
+        if root_body is not None:
+            root_joint = root_body.find(".//joint[@type='free']")
+            if root_joint is not None:
+                root_body.remove(root_joint)
 
     for extend_config in cfg.extend_config:
-        parent = root.find(f".//body[@name='{extend_config.parent_name}']")
+        if is_urdf:
+            parent = root.find(f".//link[@name='{extend_config.parent_name}']")
+        else:
+            parent = root.find(f".//body[@name='{extend_config.parent_name}']")
+            
         if parent is None:
-            raise ValueError(f"Parent body {extend_config.parent_name} not found in MJCF")
+            raise ValueError(f"Parent {extend_config.parent_name} not found")
         
         pos = extend_config.pos
-        rot = extend_config.rot
-        # create and insert a dummy body with a fixed joint
-        body = ET.Element("body", name=extend_config.joint_name)
-        body.set("pos", f"{pos[0]} {pos[1]} {pos[2]}")
-        body.set("quat", f"{rot[0]} {rot[1]} {rot[2]} {rot[3]}")
-        inertial = ET.Element("inertial", pos="0 0 0", quat="0 0 0 1", mass="0.1", diaginertia="0.1 0.1 0.1")
-        body.append(inertial)
-        parent.append(body)
+        rot = extend_config.rot # [w, x, y, z]
+
+        if is_urdf: # URDF: Insert link and fixed joint
+            link_name = extend_config.joint_name
+            ET.SubElement(root, "link", name=link_name)
+            
+            joint = ET.SubElement(root, "joint", name=f"fixed_{link_name}", type="fixed")
+            ET.SubElement(joint, "parent", link=extend_config.parent_name)
+            ET.SubElement(joint, "child", link=link_name)
+            
+            # URDF origin uses rpy, rot in yaml is quaternion [w, x, y, z]
+            # scipy needs [x, y, z, w]
+            r = sRot.from_quat([rot[1], rot[2], rot[3], rot[0]])
+            rpy = r.as_euler('xyz')
+            ET.SubElement(joint, "origin", xyz=f"{pos[0]} {pos[1]} {pos[2]}", rpy=f"{rpy[0]} {rpy[1]} {rpy[2]}")
+        else: # MJCF: Insert body
+            body = ET.Element("body", name=extend_config.joint_name)
+            body.set("pos", f"{pos[0]} {pos[1]} {pos[2]}")
+            body.set("quat", f"{rot[0]} {rot[1]} {rot[2]} {rot[3]}")
+            inertial = ET.Element("inertial", pos="0 0 0", quat="0 0 0 1", mass="0.1", diaginertia="0.1 0.1 0.1")
+            body.append(inertial)
+            parent.append(body)
 
     cwd = os.getcwd()
-    os.chdir(os.path.dirname(mjcf_path))
-    chain = pk.build_chain_from_mjcf(ET.tostring(root, method="xml"), body=root_name)
+    os.chdir(os.path.dirname(path))
+    if is_urdf:
+        chain = pk.build_chain_from_urdf(ET.tostring(root, encoding='utf8'))
+    else:
+        chain = pk.build_chain_from_mjcf(ET.tostring(root, method="xml"), body=root_name)
     os.chdir(cwd)
     return chain
 
 
-@hydra.main(version_base=None, config_path="../cfg", config_name="unitree_g1_fitting")
+@hydra.main(version_base=None, config_path="../cfg", config_name="fourier_gr3_fitting")
+# @hydra.main(version_base=None, config_path="../cfg", config_name="unitree_g1_fitting")
 def main(cfg):
     chain = build_chain(cfg)
     chain.print_tree()
@@ -139,6 +164,12 @@ def main(cfg):
         pelvis = result.joints[:, None, 0]
         smpl_keypoints = result.joints[:, smpl_joint_idx] - pelvis
         
+        #加入正则化
+        # mse_loss = (robot_keypoints - smpl_keypoints).square().sum()
+        # reg_loss = (betas ** 2).mean()
+        # loss = mse_loss + 0.01 * reg_loss
+
+
         loss = (robot_keypoints - smpl_keypoints).square().sum()
         opt.zero_grad()
         loss.backward()
@@ -148,7 +179,7 @@ def main(cfg):
                 v = result.vertices[0] - result.joints[:, 0]
             vertices.append(v)
             smpl_keypoints_history.append(smpl_keypoints[0].detach())
-            print(f"iter {i}, loss: {loss.item():.3f}")
+            print(f"iter {i}, loss: {loss.item():.3f}, betas: {betas.data}")
     
     vis = o3d.visualization.Visualizer()
     vis.create_window()
@@ -164,7 +195,7 @@ def main(cfg):
         vis.add_geometry(mesh)
 
         pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(smpl_keypoints_history[i] + offset + torch.tensor([1., 0., 0.]))
+        pcd.points = o3d.utility.Vector3dVector(smpl_keypoints_history[i] + offset) 
         pcd.colors = o3d.utility.Vector3dVector([[0, 0, 1] for _ in range(len(smpl_keypoints_history[i]))])
         vis.add_geometry(pcd)
 
@@ -187,8 +218,9 @@ def main(cfg):
 
     # increase point size for better visualization
     opt = vis.get_render_option()
-    point_size = 10.0  # You can adjust this value according to your needs
-    opt.point_size = point_size
+    if opt:
+            point_size = 10.0
+            opt.point_size = point_size
     
     vis.run()
 

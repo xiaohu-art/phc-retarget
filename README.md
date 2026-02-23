@@ -32,6 +32,7 @@ Of course, you can download the other motion files you like from the [AMASS](htt
 ## Fitting motion data from AMASS
 
 First we need to fit the smpl shape to the humanoid robot:
+export XDG_SESSION_TYPE=x11
 ```bash
 uv run scripts/1-fit_smpl_shape.py
 ```
