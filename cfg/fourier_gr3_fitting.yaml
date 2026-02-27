@@ -1,0 +1,58 @@
+humanoid_type: gr3_6dof
+
+asset:
+  assetFileName: "assets/robot/gr3_6dof/gr3_6dof/urdf/gr3_fourier_hand_6dof.urdf"
+
+extend_config:
+  - joint_name: "left_toe_link"
+    parent_name: "left_foot_roll_link"
+    pos: [0.1, 0.0, -0.02]
+    rot: [1.0, 0.0, 0.0, 0.0]
+
+  - joint_name: "right_toe_link"
+    parent_name: "right_foot_roll_link"
+    pos: [0.1, 0.0, -0.02]
+    rot: [1.0, 0.0, 0.0, 0.0]
+
+base_link: "base_link"
+joint_matches:
+  # - ["base_link", "Pelvis"]
+  - ["left_thigh_pitch_link", "L_Hip"]
+  - ["left_shank_pitch_link", "L_Knee"]
+  - ["left_foot_roll_link", "L_Ankle"]
+  - ["right_thigh_pitch_link", "R_Hip"]
+  - ["right_shank_pitch_link", "R_Knee"]
+  - ["right_foot_roll_link", "R_Ankle"]
+  - ["left_upper_arm_roll_link", "L_Shoulder"]
+  - ["left_lower_arm_pitch_link", "L_Elbow"]
+  - ["left_hand_roll_link", "L_Hand"]
+  - ["right_upper_arm_roll_link", "R_Shoulder"]
+  - ["right_lower_arm_pitch_link", "R_Elbow"]
+  - ["right_hand_roll_link", "R_Hand"]
+  - ["left_toe_link", "L_Toe"]
+  - ["right_toe_link", "R_Toe"]
+
+
+smpl_pose_modifier:
+  Pelvis: "[np.pi/2, 0, np.pi/2]"
+  L_Shoulder: "[0, 0, -np.pi/2]"
+  R_Shoulder: "[0, 0, np.pi/2]"
+  # L_Elbow: "[0, -np.pi/2, 0]"
+  # R_Elbow: "[0, np.pi/2, 0]"
+
+quat_offset:
+  Pelvis: "[0.5, -0.5, -0.5, -0.5]"
+  L_Hip: "[0.5, -0.5, -0.5, -0.5]"
+  L_Knee: "[0.5, -0.5, -0.5, -0.5]"
+  L_Ankle: "[0.5, -0.5, -0.5, -0.5]"
+  R_Hip: "[0.5, -0.5, -0.5, -0.5]"
+  R_Knee: "[0.5, -0.5, -0.5, -0.5]"
+  R_Ankle: "[0.5, -0.5, -0.5, -0.5]"
+  L_Toe: "[0.5, -0.5, -0.5, -0.5]"
+  R_Toe: "[0.5, -0.5, -0.5, -0.5]"
+  L_Shoulder: "[0.7071, 0, -0.7071, 0]"
+  L_Elbow: "[-0.7071067811865475, 0.0, 0.7071067811865475, 0.0]"
+  L_Hand: "[-0.7071067811865475, 0.0, 0.7071067811865475, 0.0]"
+  R_Shoulder: "[0, 0.7071, 0, 0.7071]"
+  R_Elbow: "[0.0, 0.7071067811865475, 0.0, 0.7071067811865475]"
+  R_Hand: "[0.0, 0.7071067811865475, 0.0, 0.7071067811865475]"
